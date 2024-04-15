@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # such24
 
 Developing and comparing routes for the Swiss Ultracycling Challenge.
@@ -15,5 +9,6 @@ This repository is split into the following parts:
 -   Initial distance matrix, initial routing, recording crossing-cantons
 -   Loading closest possible starting points, routing to the respective
     CPs
--   Getting routes for all combinations
+-   Routing for all CP combinations (segments)
+-   Solving the optimal order for each CP combination
 -   Vizualising and comparing routes
