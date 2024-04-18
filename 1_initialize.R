@@ -7,17 +7,58 @@ library(mapview)
 library(furrr)
 library(beepr)
 library(TSP)
+library(geodata)
 # library(fst)
 
+
 workd = "C:/Users/hrzd/Downloads/" #"/Users/opsadmin/Downloads
+geodata_dir = "./geodata"
+brouter_segments_dir = "./geodata/brouter_segments/"
 
-cp_file = paste0(workd,"such24_cps_20240415.csv")
+cp_file = paste0(workd,"such24_cps_202404181.csv")
 
+
+# get basic geodata -------------------------------------------------------
+
+# getting country and canton borders
+ch_borders = gadm("switzerland", path = geodata_dir) |>
+  st_as_sf() |> 
+  transmute(id = str_sub(HASC_1, 4,5), geometry) # canton ids like in the table
+plot(ch_borders, graticule = TRUE, axes = TRUE)
+
+# get all necessary osm segments for brouter ------------------------------
+
+download_dir = "https://brouter.de/brouter/segments4/" # direct
+rough_bbox = floor(st_bbox(ch_borders))
+necessary_brouter_segments = expand_grid(
+  x = (rough_bbox$xmin/5):(rough_bbox$xmax/5)*5,
+  y = (rough_bbox$ymin/5):(rough_bbox$ymax/5)*5) %>%
+  filter(x != 10) |> 
+  mutate(dl_url = glue::glue("{download_dir}E{x}_N{y}.rd5"))
+
+if(!dir.exists(brouter_segments_dir)) dir.create(brouter_segments_dir)
+
+# walk(necessary_brouter_segments$dl_url,
+#      download.file, method = "curl", 
+#      destfile = brouter_segments_dir)
+
+
+# load CPs ----------------------------------------------------------------
+
+# load table of CP info
 cp_table = read_csv(cp_file)
+cp_table
 
 # generate possible combinations of skipped and not-skipped CPs
-5*5*3*3*3*6*4
-cp_table |> filter(!is.na(group)) |> count(group) |> pull(n) |> magrittr::add(1) |> prod() 
+5*5*3*3*3*6*4 # number of combinations
+cp_table |> 
+  filter(!is.na(group)) |>
+  count(group) |> 
+  pull(n) |> 
+  magrittr::add(1) |>
+  prod() 
+
+# all percievalbe combinations
 
 skip_combinations = cp_table |> 
   filter(!is.na(group)) |> 
@@ -29,33 +70,35 @@ skip_combinations = cp_table |>
   as_tibble() |> 
   set_names(paste0("skip",1:7)) |> 
   filter(
-    !is.na(skip4), # at least BS or SH are easily skipable
-    !is.na(skip5),
-    !is.na(skip7), # at least GE is easily skipable
-    !(skip6 == "VD" & skip7 != "GE")) # have to skip GE when skipping VD
-
-
-expand_grid(from = cp_table$id[-6:0],
-            to = cp_table$id[-6:0]) %>%
-  filter(from != to,
-         from != "EN")
+    # !is.na(skip4), # at least BS or SH are easily skipable
+    # !is.na(skip5),
+    # !is.na(skip7), # at least GE is easily skipable
+    !(skip6 == "VD" & skip7 != "GE"), # have to skip GE when skipping VD
+    !(skip2 == "ZH" & skip4 != "SH")) # have to skip SH when skipping ZH 
 
 # load points -------------------------------------------------------------
-points = read_sf(point_file) %>%
-  select(name = ends_with("text")) %>%
-  filter(!is.na(name)) %>%
-  mutate(canton = str_sub(name, 1, 2),
-         no = str_sub(name, 3, 3),
-         x = sf::st_coordinates(.)[,1],
-         y = sf::st_coordinates(.)[,2])
+cp_sf = cp_table %>%
+  st_as_sf(coords = c("lon", "lat")) |> 
+  st_set_crs(4326)
 
-skippable_cantons = points$canton[!points$canton %in% c("EP","CP")] %>%
-  unique()
+# plot cantons and CPs
+mapview(list(ch_borders,cp_sf))
 
-# plot points -------------------------------------------------------------
+# generating shapes to check for routes intersecting ----------------------
+
+# shape of swiss border
+ch_border = ch_borders |> 
+  sf::st_union() |>
+  st_cast('MULTILINESTRING')
+
+# shapes of skippable cantons
+skippable_cantons = ch_borders |> 
+  left_join(cp_table) |> 
+  filter(!is.na(group)) |> 
+  select(id)
 
 # set up realistic point pairs --------------------------------------------
-dis_mat_test =  st_distance(points, points)
+dis_mat_test =  st_distance(cp_sf, cp_sf)
 hist(dis_mat_test/1000)
 
 point_combinations = expand_grid(from = cp_table$id,
@@ -64,14 +107,12 @@ point_combinations = expand_grid(from = cp_table$id,
          from != "EN")
 
 border_pairs = point_combinations %>%
-  filter(!str_sub(one,1,2) %in% c("CP", "EP"),
-         !str_sub(two,1,2) %in% c("CP", "EP")) %>%
-  mutate(index_one = map_int(one, ~which(points$name == .x)),
-         index_two =  map_int(two, ~which(points$name == .x)),
-         distance = map2_dbl(index_one, index_two, ~dis_mat_test[.x,.y])) %>%
-  filter(distance < 1000, one != "ZG1", two != "ZG1") %>%
-  select(one, two) %>%
-  arrange(str_sub(one,1,2), str_sub(two,1,2), one, two)
+  #  mutate(index_from = map_int(from, ~which(points$name == .x)),
+  #        index_to =  map_int(to, ~which(points$name == .x)),
+  #        distance = map2_dbl(index_from, index_to, ~dis_mat_test[.x,.y])) %>%
+  # filter(distance < 1000) %>%
+  select(from, to) |> 
+  left_join(select(cp))
 
 # generate realistic point pools ------------------------------------------
 point_pool_test = points %>%
