@@ -1,5 +1,6 @@
 # set up ------------------------------------------------------------------
 library(tidyverse)
+library(here)
 library(sf)
 library(httr)
 library(data.table)
@@ -9,22 +10,15 @@ library(beepr)
 library(TSP)
 library(geodata)
 # library(fst)
-
-
-workd = "C:/Users/hrzd/Downloads/" #"/Users/opsadmin/Downloads
-geodata_dir = "./geodata"
-brouter_segments_dir = "./geodata/brouter_segments/"
-
-cp_file = paste0(workd,"such24_cps_202404181.csv")
-
+here::i_am("1_initialize.R")
+brouter_segments_dir =  here("geodata", "brouter_segments")
+cp_file = max(list.files(here(),"such24_cps_")) # get latest CP table file
 
 # get basic geodata -------------------------------------------------------
 
-# getting country and canton borders
-ch_borders = gadm("switzerland", path = geodata_dir) |>
-  st_as_sf() |> 
-  transmute(id = str_sub(HASC_1, 4,5), geometry) # canton ids like in the table
-plot(ch_borders, graticule = TRUE, axes = TRUE)
+# loading country and canton borders, file modified from swissBOUNDARIES3D
+ch_borders = st_read(here("geodata", "ch_cantons.gpkg")) 
+plot(ch_borders, graticule = TRUE, axes = TRUE) # overview
 
 # get all necessary osm segments for brouter ------------------------------
 
@@ -76,13 +70,10 @@ skip_combinations = cp_table |>
     !(skip6 == "VD" & skip7 != "GE"), # have to skip GE when skipping VD
     !(skip2 == "ZH" & skip4 != "SH")) # have to skip SH when skipping ZH 
 
-# load points -------------------------------------------------------------
+# CPs as points -------------------------------------------------------------
 cp_sf = cp_table %>%
   st_as_sf(coords = c("lon", "lat")) |> 
   st_set_crs(4326)
-
-# plot cantons and CPs
-mapview(list(ch_borders,cp_sf))
 
 # generating shapes to check for routes intersecting ----------------------
 
@@ -93,9 +84,15 @@ ch_border = ch_borders |>
 
 # shapes of skippable cantons
 skippable_cantons = ch_borders |> 
-  left_join(cp_table) |> 
+  st_join(cp_sf) |> 
   filter(!is.na(group)) |> 
-  select(id)
+  select(id, group)
+
+# plot cantons and CPs
+mapview(ch_borders, col.regions = "grey", legend = FALSE) +
+  mapview(list(skippable_cantons,cp_sf), 
+          zcol = "group", 
+          legend = c(FALSE, TRUE))
 
 # set up realistic point pairs --------------------------------------------
 dis_mat_test =  st_distance(cp_sf, cp_sf)
