@@ -59,16 +59,22 @@ skip_combinations = cp_table |>
   group_by(group) |> 
   summarize(ids = list(id)) |>
   pull(ids) |> 
-  map(c,NA) |> 
+  map(c,"NA") |> 
   expand.grid() |> 
   as_tibble() |> 
   set_names(paste0("skip",1:7)) |> 
   filter(
-    # !is.na(skip4), # at least BS or SH are easily skipable
-    # !is.na(skip5),
-    # !is.na(skip7), # at least GE is easily skipable
+    # skip4 != "NA", # at least BS or SH are easily skipable
+    # skip5 == "NA",
+    # skip7 != "NA", # at least GE is easily skipable
     !(skip6 == "VD" & skip7 != "GE"), # have to skip GE when skipping VD
-    !(skip2 == "ZH" & skip4 != "SH")) # have to skip SH when skipping ZH 
+    !(skip2 == "ZH" & skip4 != "SH")) |> # have to skip SH when skipping ZH
+  mutate(across(everything(), na_if, "NA")) |> 
+  rowwise() |> 
+  mutate(skip_n = sum(!is.na(c_across(everything())))) |> 
+  ungroup() 
+
+skip_combinations |> count(skip_n)
 
 # CPs as points -------------------------------------------------------------
 cp_sf = cp_table %>%
@@ -103,31 +109,31 @@ point_combinations = expand_grid(from = cp_table$id,
   filter(from != to,
          from != "EN")
 
-border_pairs = point_combinations %>%
-  #  mutate(index_from = map_int(from, ~which(points$name == .x)),
-  #        index_to =  map_int(to, ~which(points$name == .x)),
-  #        distance = map2_dbl(index_from, index_to, ~dis_mat_test[.x,.y])) %>%
-  # filter(distance < 1000) %>%
-  select(from, to) |> 
-  left_join(select(cp))
+all_routing_scenarios = expand_grid(point_combinations, skip_combinations) |> 
+  mutate(across(3:9, coalesce, "NA")) |> 
+  filter(from != skip1, from != skip2, from != skip3, from != skip4,
+         from != skip5, from != skip6, from != skip7,
+         to != skip1, to != skip2, to != skip3, to != skip4,
+         to != skip5, to != skip6, to != skip7) |> 
+  mutate(across(3:9, na_if, "NA"))
 
 # generate realistic point pools ------------------------------------------
-point_pool_test = points %>%
-  st_drop_geometry() %>%
-  select(-no) %>%
-  filter(!canton %in% c("EP", "CP"),
-         # only the ones to filter for border points for now
-         !canton %in% c("TG", "JU", "NE", "OW","AI","AR"),
-         # filtering low priority points
-         !name %in% c("BS1","GL3")) %>%
-  group_by(canton) %>%
-  summarize(points = list(unique(name))) %>%
-  as.list()
+# point_pool_test = points %>%
+#   st_drop_geometry() %>%
+#   select(-no) %>%
+#   filter(!canton %in% c("EP", "CP"),
+#          # only the ones to filter for border points for now
+#          !canton %in% c("TG", "JU", "NE", "OW","AI","AR"),
+#          # filtering low priority points
+#          !name %in% c("BS1","GL3")) %>%
+#   group_by(canton) %>%
+#   summarize(points = list(unique(name))) %>%
+#   as.list()
 
-set_names(point_pool_test$points, point_pool_test$canton) %>%
-  lengths() %>% prod()
+# set_names(point_pool_test$points, point_pool_test$canton) %>%
+#   lengths() %>% prod()
 
-# generate all combinations, CAREFUL: needs RAM!
-pool_test2 = set_names(point_pool_test$points, point_pool_test$canton) %>%
-  do.call(data.table::CJ, .) %>%
-  mutate_all(as_factor)
+# # generate all combinations, CAREFUL: needs RAM!
+# pool_test2 = set_names(point_pool_test$points, point_pool_test$canton) %>%
+#   do.call(data.table::CJ, .) %>%
+#   mutate_all(as_factor)
