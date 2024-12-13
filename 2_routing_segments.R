@@ -1,175 +1,250 @@
-# prepare routing API calls -----------------------------------------------
-
-# load in custom no-go zones to avoid leaving the country
-nogos_base = read_file("border_nogos.txt") |> 
-  str_replace_all("\\;", "\\|")
-# load custom no-go zones for every skippable canton
-nogos_cantons = cp_table |> 
-  filter(!is.na(group)) |> # is skippable
-  select(id, nogo_zones) |> 
-  mutate(nogo_zones = str_replace_all(nogo_zones, "\\;", "\\|"))
-
-
-brouter_profile = "such" # set brouter profile
-brouter_hostname = "http://localhost:17777" # set brouter hostname
-api_url = paste0(brouter_hostname, # base brouter API url
-                 "/brouter?profile=", brouter_profile,
-                 "&alternativeidx=0&format=geojson&lonlats=")
-
-# create segments folder if missing
-if(!dir.exists(here("segments"))) dir.create(here("segments"))
-
-
-# test data ---------------------------------------------------------------
-
-route_no = 1 # 614 # ge-AI
-one = point_routes$one[route_no]
-two = point_routes$two[route_no]
-ytwo = point_routes$ytwo[route_no]
-xtwo = point_routes$xtwo[route_no]
-yone = point_routes$yone[route_no]
-xone = point_routes$xone[route_no]
-skip =  point_routes$skip[route_no]# sort(c(NA, NA, "ZH", "SH", "BS", NA, NA))
-
-# function to get route and save result as numbers and shape --------
-
-get_route = function(one, two, xone, yone, xtwo, ytwo, skip) {
-  # api_url2 = "6.126165,46.317771|7.622538,47.547481"
-  
-  lonlats = paste0(xone, ",", yone, "|", xtwo, ",", ytwo)
-  # combine no-go zones of all cantons to be skipped + general zones
-  nogos_combo = nogos_cantons |> 
-    filter(id %in% skip) |>
-    pull("nogo_zones") |> 
-    na.omit() |> 
-    paste0(collapse = "|")
-  nogos_url = paste0("&nogos=", nogos_base, "|", nogos_combo)
-  
-  # call BRouter API for route
-  api_response = try(
-    jsonlite::fromJSON(txt = paste0(api_url, lonlats, nogos_url)),
-    silent = TRUE)
-  
-  # abort when API gives error
-  if(class(api_response) == "try-error") return(NULL)
-  
-  # extract shape of route
-  linestring = try(
-    st_linestring(api_response$features$geometry$coordinates[[1]]),
-    silent = TRUE)
-  
-  # if shape is faulty, try fixing it by filling holes
-  if(any(class(linestring) == "try-error", na.rm = TRUE)) {
-    geo_to_fix = api_response$features$geometry$coordinates[[1]]
-    fix_line = lengths(geo_to_fix) == 2
-    cat(one, two, sum(fix_line), "\n")
-    geo_to_fix[fix_line] <- lapply(geo_to_fix[fix_line], c,NA)
-    linestring = geo_to_fix %>% 
-      unlist() %>% 
-      matrix(ncol = 3, byrow = TRUE) %>% 
-      as.data.frame() %>%
-      fill(V3, .direction = "downup") %>% 
-      as.matrix() %>% 
-      st_linestring()
-  }
-  
-  # check if route leaves the country
-  xing_ch_border = linestring |> 
-    st_zm() |> 
-    st_crosses(ch_border, sparse = FALSE) |>
-    as.logical()
-  
-  # check what skippable cantons the route crosses
-  xing_cantons_logi = st_intersects(skippable_cantons,
-                                    st_zm(linestring), 
-                                    sparse = FALSE)
-  xing_cantons = pull(skippable_cantons,id)[xing_cantons_logi] |>
-    setdiff(c(one, two))
-  
-  # commpile route information
-  skipped_cantons = paste0(sort(na.omit(skip)), collapse = "-")
-  route_info = cbind(paste0(one,"-",two,"_",skipped_cantons),
-                     one, two,
-                     skip = skipped_cantons,
-                     xing = paste0(xing_cantons, collapse = "-"),
-                     xing_ch_border,
-                     api_response$features$properties[,c(3,4,6,7,8)])
-  
-  # write route info to table (appending)
-  write_csv(route_info, 
-            here("cp_routes_test3.csv"),
-            append = TRUE)
-  
-  # create shape file of route with info
-  shapefile = route_info %>% 
-    add_column(list(linestring)) %>%
-    st_as_sf() %>%
-    st_set_crs(4326)
-  
-  # write route shape file
-  st_write(shapefile,
-           here("segments", 
-                paste0(one, two, "_",
-                       skipped_cantons,
-                       ".geojson")),
-           quiet = TRUE)
-}
-
 # get routes for point pairs ----------------------------------------------
 
-first_cols = c("id", "one", "two", "skip", "xing", "xing_ch_border",
-               "track-length", "filtered ascend", "total-time", "total-energy",
-               "cost")
-already_routed = read_csv(here("cp_routes_test2.csv"),
-                          col_names = first_cols) %>%
-  mutate(onetwo = paste0(one, two))
+plan(multisession, workers = 4) # set up parallel processing
 
-point_routes = point_combinations %>%
-  left_join(cp_table, by = c("from" = "id")) %>%
-  left_join(cp_table, by = c("to" = "id"), suffix = c("from", "to")) %>%
-  select(from, to, lonfrom, latfrom, lonto, latto) |> 
-  inner_join(all_single_crosses) |>
-  mutate(skip = xing) |> select(-xing) |>
-  # mutate(skip = "") |> 
-  set_names(c("one", "two", "xone", "yone", "xtwo", "ytwo", "skip")) |> 
-  filter(!paste0(one,two,skip) %in% 
-           paste0(already_routed$one, 
-                  already_routed$two,
-                  already_routed$skip))
+# function to get all requested route results available 
+# convert them to minimal table sorted for shortest routes
+get_already_routed = function(segmentfile = "segments_1.csv", 
+                              raw = FALSE) {
+  csv_output = here(segmentfile) |> 
+    read_csv(col_names = first_cols,
+             col_types = "cccccliiiii",
+             na = "NA")
+  if(raw) return(csv_output)
+  csv_output |> 
+    arrange(from, to, energy, skip) |> # also try cost/energy
+    select(id, from1 = from, to1 = to, xing) |> 
+    mutate(xing = str_replace_all(xing, "-", "\\|") |> str_replace("^$", " ")) 
+}
 
-library(tictoc)
+# function to prepare table of segments to route and trigger routing
+route_segments = function(selected_routes) {
+  point_routes = selected_routes %>%
+    left_join(cp_coords, by = c("from" = "id")) %>%
+    left_join(cp_coords, by = c("to" = "id"), 
+              suffix = c("from", "to")) %>%
+    mutate(skip = paste(skip1, skip2, skip3, skip4, skip5, skip6, skip7, 
+                        sep = ",") |> 
+             str_remove_all("NA") |> 
+             str_remove_all("^,+|,+$") |> 
+             str_replace_all(",+", "-"),
+           table_file = file_name_save) |> 
+    select(from, to, lonfrom, latfrom, lonto, latto, skip, table_file) |> 
+    # remove already routed segments from list
+    filter(!paste0(from, "-", to, "_", skip) %in% already_routed$id)
+  
+  n_routes = nrow(point_routes)
+  if(n_routes == 0) {
+    cat("\nAll segments were already routed.")
+  } else {
+    goodtogo = menu(c("Yes", "No"), 
+                    title = paste("Start routing", n_routes, "segments?"))
+    if(goodtogo == 1) {
+      cat("\nRouting", n_routes, "segments...")
+      tic()
+      point_routes %>% 
+        sample_frac() |>
+         pwalk(get_route, .progress = TRUE)
+        # future_pwalk(get_route,
+        #              .progress = TRUE)
+      toc()
+      beep(2)
+    }
+  }
+}
 
-plan(multisession, workers = 4)
+file_name_save = "segments_1.csv"
+
+# check for already routed segments
+if(!file.exists(here(file_name_save))) {
+  write_file("", here(file_name_save))
+}
+
+already_routed = get_already_routed(file_name_save)
+
+
+# check for already routed segments and route files integrity -------------
+route_check = function() {
+  already_routed = get_already_routed(file_name_save)
+   # check for duplicate entries in segments csv
+  dupl_routed = already_routed |> add_count(id) |> filter(n > 1) |> pull(id)
+  if(length(dupl_routed) > 0) {
+    cat(paste(dupl_routed, collapse = "\n"))
+    stop("\nResults in table duplicated.")
+  }
+  
+  # check for mismatch between csv file and route shapes
+  already_routed_files = tibble(id = str_remove(list.files(here("segments")),
+                                                ".geojson"),
+                                file = TRUE)
+  already_routed_mismatch = already_routed |>
+    full_join(already_routed_files, by = "id")
+  
+  no_shape = already_routed_mismatch |> filter(is.na(file)) |> pull(id)
+  if(length(no_shape) > 0) {
+    cat(paste(no_shape, collapse = "\n"))
+    stop("\nResults in table but missing shape!")
+  }
+  
+  only_shape = already_routed_mismatch |> 
+    filter(is.na(from1), str_sub(id, 1, 2) != "ST") |> 
+    pull(id)
+  if(length(only_shape) > 0) {
+    cat(paste(only_shape, collapse = "\n"))
+    goodtogo = menu(c("Yes", "No"), 
+                    title = "\nResults as shape but missing entry in table!
+                  Remove?")
+    if(goodtogo == 1) {
+      here("segments", paste0(only_shape,".geojson")) %>% file.remove()
+    }
+  }
+  
+  # check routes for leaving the country or crossing cantons they should skip
+  intersection_issues = get_already_routed(file_name_save, raw = TRUE) |> 
+    mutate(xing2 = str_replace(xing, "^$", " ") |> 
+             str_replace_all("-", "\\|")) |> 
+    filter(xing_ch_border | str_detect(skip, xing2)) |> 
+    arrange(skip, from, to)
+  if(nrow(intersection_issues) > 0) {
+    intersection_issues
+    stop("Routes cross canton they should skip.
+         Review the relevant no-go zones.")
+  } 
+}
+
+# check for routes in combinations with no skipped cantons ----------------
+
+route_check()
+
+# first check no skip scenario for easy no-crossing-routes
+all_routing_scenarios |> 
+  filter(skip_n < 1) |> 
+  route_segments()
+
+already_routed = get_already_routed(file_name_save)
+# check which segments never cross any other critical canton
+no_xing_routes = already_routed |> filter(xing == " ") 
+
+# edit main table with all those cases
+all_routing_scenarios = all_routing_scenarios |> 
+  mutate(id =  paste0(from, "-", to, "_"),
+         id = if_else(skip_n == 0 | id %in% no_xing_routes$id,
+                      id, as.character(NA)))
+
+
+
+# preparing batch of combinations with just one skipped canton ------------
+
+# from previous run get all segments which cross any skippable canton 
+all_single_crosses = already_routed |> 
+  filter(str_detect(id, "_$")) |> 
+  select(from = from1, to = to1, skip = xing) |> 
+  mutate(skip = str_split(skip, "\\|")) |> 
+  unnest(skip) |> 
+  filter(skip != " ") |> 
+  distinct()
+
+check_routing_scenarios = all_routing_scenarios |> 
+  filter(skip_n == 1,
+         is.na(id)) |> 
+  mutate(skip = paste(skip1, skip2, skip3, skip4, skip5, skip6, skip7, 
+                      sep = ",") |> 
+           str_remove_all("NA") |> 
+           str_remove_all("^,+|,+$") |> 
+           str_replace_all(",+", "|")) #|> 
+# nest(skips = -c(from, to))
+
+check_routing_scenarios |> 
+  # want to add any (theoretical) ZH-skip segment
+  # even though they don't appear in the full list due to only combining with SH
+  bind_rows(cbind(point_combinations, skip2 = "ZH", skip = "ZH")) |> 
+  filter(!((from == "SH" & skip == "ZH") | (to == "SH" & skip == "ZH"))) |> 
+  inner_join(all_single_crosses) |> 
+  route_segments()
+
+# check for issues with routes
+route_check()
+
+# attempt testing all routes shortest to farthest for compatibility ---------
+# fetch all already routed segments
+already_routed = get_already_routed(file_name_save)
+
+# split up all_combo_list in id = NA and already found ones
+split_routing_scenarios = all_routing_scenarios |>
+  mutate(skip = paste(skip1, skip2, skip3, skip4, skip5, skip6, skip7, 
+                      sep = ",") |> 
+           str_remove_all("NA") |> 
+           str_remove_all("^,+|,+$") |> 
+           str_replace_all(",+", "|")) |> 
+  split(is.na(all_routing_scenarios$id))
+# only iterate through id = NA part (later merge again)
+missing_routing_scenarios = split_routing_scenarios[["TRUE"]]
+# group entire list of combos (any skip_n) by from/to
+grouped_scenarios = missing_routing_scenarios |> 
+  split(paste0(missing_routing_scenarios$from,
+               missing_routing_scenarios$to))
+
+# iterate through finished routes for this segment (shortest to longest)
+assign_routes = function(fromto_group) {
+  filtered_arleady_routed = already_routed |> 
+    filter(#!str_detect(id, "-.._..-..-"),
+           from1 == fromto_group$from[1],
+           to1 == fromto_group$to[1])
+  for(i in 1:nrow(filtered_arleady_routed)) {
+    #  check for compatibility of xing cantons with all skip combos 
+    crossing_skip = str_detect(filtered_arleady_routed$xing[i],
+                               fromto_group$skip)
+    # assign respective route IDs top-to-bottom
+    new_fill = !crossing_skip & is.na(fromto_group$id)
+    fromto_group[new_fill,"id"] <- filtered_arleady_routed$id[i]
+  }
+  # at end of list of already routed ones, return table
+  return(fromto_group)
+}
 tic()
-route_shape2 = point_routes %>% 
-  # dplyr::arrange(desc(one)) %>% 
-  sample_frac() |>
-  future_pmap(get_route,
-              .progress = TRUE)
- #  filter(one == "GE", two == "VD") |> 
- # pmap(get_route)
+check_scenarios = future_modify(grouped_scenarios, assign_routes)
 toc()
 
-beep(2)
+# analyze NAs
+check_scenarios |>
+  bind_rows() |> 
+  count(skip_n, covered = !is.na(id)) |>
+  pivot_wider(id_cols = skip_n, names_from = covered, values_from = n)
 
-# combine all generated routes
-all_routes =  do.call(rbind, route_shape2)
+# merge previously id = NA with the rest again
+all_routing_scenarios = bind_rows(split_routing_scenarios[["FALSE"]],
+                                  bind_rows(check_scenarios))
 
+all_routing_scenarios |> 
+  group_by(skip, skip_n) |> 
+  summarize(completely_routed = (n()-sum(is.na(id)))/n()) |> 
+  ungroup()-> check 
 
-all_single_crosses = already_routed |> filter(one != "one") |> 
-  st_drop_geometry() |> 
-  filter(is.na(skip)) |> 
-  select(from = one, to = two, xing) |> 
-  mutate(xing = str_split(xing, "-")) |> 
-  unnest(xing) |> 
-  filter(xing != "")
+all_routing_scenarios |> filter(skip5 == "AR", !is.na(skip7), !is.na(skip4)) |> 
+    group_by(skip, skip_n) |> 
+   summarize(completely_routed = ((n()-sum(is.na(id)))/n())==1,
+             n_skip = str_length(id)) |> 
+  ungroup() |> count(skip_n, n_skip) |> 
+  pivot_wider(id_cols = skip_n, names_from = n_skip, values_from = n)
+# limit table to desired/next skip_n (just a single one!)
+all_routing_scenarios |> 
+  filter(skip_n == 5,
+         is.na(id)) |>
+  # filter(!paste0(from, "-", to, "_", 
+  #                str_replace_all(skip,"\\|","-")) %in%
+  #          already_routed$id) -> selected_routes
+# route these skip-combos
+route_segments()
 
-all_single_crosses |> count(from, to) |> count(n) |> pull(nn) |> sum()
+# check for issues with routes
+route_check()
 
-all_single_crosses |>
-  group_by(to, xing) |> summarize(n = n()) |> 
-    ggplot(aes(xing, to, fill = n)) + geom_tile() + scale_fill_viridis_c()
+# start over from top but this time limit the iterations through already done routes:
 
-# how many times is each canton crossed
-all_crosses = all_routes |> pull(xing) |> str_split("-") |> unlist() |> table()
-cross_freq = tibble(id = names(all_crosses), n_cross = as.integer(all_crosses))
+# count |s in already routed $ skip and only check the last routed ones (highest count)
+# str_count(skip, "|") == max(str_count(skip, "|"))
+
+remove(split_routing_scenarios)
+remove(grouped_scenarios)
+remove(check_scenarios)
+remove(missing_routing_scenarios)

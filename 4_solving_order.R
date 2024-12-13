@@ -1,67 +1,109 @@
 
-# generate different distance matrices per pool -------------------------
-# distance
-# hm
-# energy
-# time
+# prepare table for all possible scenarios --------------------------------
+already_routed_raw = get_already_routed(raw = TRUE)
 
-all_routes = read_csv(paste0(workd, "routes4.csv"), col_types = "cciiiii") %>%
-  arrange(one, two)
-EP_row = data.frame("EP", t(rep(0L, 76))) %>%
-  set_names(c("one", unique(all_routes$two)))
-point_order_def = c("EP","CP1","CP2","CP3","CP4","CP5")
-point_order = c(point_order_def,
-                setdiff(sort(unique(all_routes$two)),point_order_def))
+all_to_route = all_routing_scenarios |> 
+  group_by(skip) |> 
+  filter(n() == sum(!is.na(id))) |> 
+  ungroup() 
 
-parameter = "energy"
-dismat_distance = all_routes %>%
-  select(1:2, all_of(parameter)) %>%
-  pivot_wider(names_from = two, values_from = 3, values_fill = 0L) %>%
-  rbind(EP_row) %>%
-  mutate(one = factor(one, point_order)) %>%
-  arrange(one) %>%
-  select(all_of(point_order)) %>%
-  as.matrix()
+ST_row_prep = get_already_routed("st_routes.csv", raw = TRUE) |> 
+  select(id, from, to, xing, 7:11) |> 
+  arrange(time)
+
+split_scenarios = split(all_to_route, all_to_route$skip)
 
 
-# set up tsp solver -------------------------------------------------------
+# iterate over scenarios --------------------------------------------------
+plan(multisession, workers = 13) # with list of scenarios 7050 taking 70 mins
+tic()
 
-concorde_path(workd)
-# filter distance matrices for point pool
-#thorsten orig
-pool = c("CP4","UR2","SZ3","LU1","NW1","OW1","ZG1","GL2","GR1","CP3","AI2",
-         "CP1","AR1",
-         "TG1","CP5","AG6","BL1","BS2","SO1","CP2","EP")
-#jonas orig
-pool = c("CP4", "GR2", "UR2", "VS2", "OW2", "NW1", "LU1", "ZG2", "SZ2", "GL2",
-         "CP3", "AI2", "AR1", "CP1",
-         "TG1", "CP5", "BL1", "SO1", "NE1", "CP2", "EP")
+all_tours = split_scenarios |>  
+  sample() |> 
+  future_map(function(route_df) {
+    # get descriptive data of scenario
+    scenario_details = route_df |> head(1) |> select(starts_with("skip"))
+    
+    point_order = c("ST", intersect(cp_coords$id, unique(route_df$to))) 
+    
+    ST_row = ST_row_prep |>
+      filter(to %in% point_order) |> 
+      # filter out start point routes crossing skipped cantons
+      filter(!str_detect(xing, str_replace(scenario_details$skip, "^$", " ")) |
+               is.na(xing)) |> 
+      select(-xing) |> 
+      distinct(to, .keep_all = TRUE)
+    
+    EP_row = set_names(data.frame(NA, "EN", "ST", 0L, 0L, 0L, 0L, 0L),
+                       names(ST_row))
+    
+    # only use routes needed
+    routes_selection = already_routed_raw %>%
+      filter(id %in% route_df$id) |> 
+      select(id, from, to, 7:11) |>
+      bind_rows(ST_row, EP_row)
+    
+    # generate different distance matrices per pool -------------------------
+    # distance, hm, time (== energy), cost
+    
+    c("distance", "ascend", "time", "cost") |> 
+      map(function(parameter = "cost") {
+        # set up distance matrix for each route parameter
+        distance_matrix = routes_selection %>%
+          select(from, to, all_of(parameter)) %>%
+          # widen table for one row to "distances" to all other points
+          pivot_wider(names_from = to, values_from = 3, values_fill = 10^9) %>% 
+          # sort rows and column to be symmetrical
+          mutate(from = factor(from, point_order)) %>%
+          arrange(from) %>%
+          select(all_of(point_order)) %>%
+          as.matrix()
+        
+        defined_atsp = ATSP(distance_matrix)
+        
+        # solve TSP and extract results------------------------------------------------
+        
+        tour_results = list(x = rep(list(defined_atsp),1000), 
+                            method = rep(c("farthest_insertion", 
+                                           "cheapest_insertion"), 500),
+                            two_opt = c(rep(TRUE, 500), rep(FALSE, 500))) %>%
+          pmap(solve_TSP)
+        tour_lengths = map_int(tour_results, tour_length)
+        
+        1L:3L |> 
+          map(function(tour_rank = 1L) {
+            tour_length_selected = sort(unique(tour_lengths))[tour_rank]
+            tour_i = tour_lengths == tour_length_selected
+            optimal_tour = tour_results[tour_i][[1]] |> 
+              cut_tour("ST", FALSE) |> 
+              names()
+            # get all parameters for respective tour
+            routes_selection |> 
+              filter(paste0(from,to) %in%
+                       paste0(optimal_tour, lead(optimal_tour))) |> 
+              mutate(from = factor(from, optimal_tour)) %>%
+              arrange(from) |> 
+              select(-2:-3) |> 
+              summarise(across(-id, sum),
+                        ids = str_c(na.omit(id), collapse = "|")) |> 
+              bind_cols(tour_length = tour_length_selected,
+                        tour_rank = tour_rank,
+                        n_solution = sum(tour_i),
+                        optimal_tour = str_c(optimal_tour, collapse = "-"),
+                        first_cp = optimal_tour[2])
+          }) |> 
+          list_rbind() |> 
+          bind_cols(parameter = parameter)
+      }) |> 
+      list_rbind()  |> 
+      bind_cols(scenario_details)
+  },
+  .progress = TRUE) |> 
+  list_rbind() |> 
+  select(starts_with("skip"), optimal_tour, parameter,
+         tour_rank, tour_length, 
+         distance, ascend, time, energy, cost,
+         first_cp, n_solution, ids)
+toc()
 
-#jonas neu
-pool = c("CP4", "GR2", "UR2", "VS2", "OW2", "NW1", "LU1", "ZG2", "SZ2", "GL2",
-         "CP3", "AI2", "AR1", "CP1",
-         "TG1", "CP5","AG1", "BL3", "SO1", "NE1", "CP2", "EP")
-
-unique(str_sub(all_routes$two,1,2))[!unique(str_sub(all_routes$two,1,2)) %in%
-                                      str_sub(pool,1,2) ]
-pool_selec= which(point_order %in% pool)
-dismat = dismat_distance[pool_selec, pool_selec] %>% ATSP()
-
-# dismat %>% reformulate_ATSP_as_TSP(cheap=-1, infeasible = 10^7) %>%
-#   solve_TSP(method = "concorde",
-#             control = list(clo = "-v -B"))
-
-dasd2 = rep(list(dismat),100) %>%
-  map(solve_TSP, method = "cheapest_insertion", two_opt = TRUE)
-dasd2 %>% map_int(tour_length) %>% sort() %>% hist()
-tour_lengths = dasd2 %>% map_int(tour_length)
-min_tours = dasd2[tour_lengths==min(tour_lengths)]
-length(min_tours)
-min(tour_lengths)
-optimal_tour = min_tours[[1]] %>% cut_tour("EP", FALSE) %>% .[c(2:21,1)]
-
-
-# transform to a tsp problem
-dismat_distance %>% as.matrix() %>% ATSP()
-
-# solve
+write_csv(all_tours, here("tours_list_v1_nrg.csv"))
